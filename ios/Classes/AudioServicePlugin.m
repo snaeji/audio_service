@@ -97,6 +97,16 @@ static MPMediaItemArtwork* artwork = nil;
     // Initialise AVAudioSession
     [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
     [[AVAudioSession sharedInstance] setActive: YES error: nil];
+      [AVAudioSession sharedInstance];
+         // register for notifications
+         [[NSNotificationCenter defaultCenter] addObserver:self
+                                                  selector:@selector(interruption:)
+                                                      name:AVAudioSessionInterruptionNotification
+                                                    object:nil];
+         [[NSNotificationCenter defaultCenter] addObserver:self
+                                                  selector:@selector(routeChange:)
+                                                      name:AVAudioSessionRouteChangeNotification
+                                                    object:nil];
     // Set callbacks on MPRemoteCommandCenter
     commandCenter = [MPRemoteCommandCenter sharedCommandCenter];
     [commandCenter.togglePlayPauseCommand setEnabled:YES];
@@ -278,6 +288,75 @@ static MPMediaItemArtwork* artwork = nil;
     [backgroundChannel invokeMethod:call.method arguments:call.arguments result: result];
   }
 }
+
+- (void)interruption:(NSNotification*)notification {
+// get the user info dictionary
+NSDictionary *interuptionDict = notification.userInfo;
+// get the AVAudioSessionInterruptionTypeKey enum from the dictionary
+NSInteger interuptionType = [[interuptionDict valueForKey:AVAudioSessionInterruptionTypeKey] integerValue];
+// decide what to do based on interruption type here...
+switch (interuptionType) {
+    case AVAudioSessionInterruptionTypeBegan:
+        NSLog(@"Audio Session Interruption case started.");
+        [backgroundChannel invokeMethod:@"onPause" arguments:nil];
+
+        // fork to handling method here...
+        // EG:[self handleInterruptionStarted];
+        break;
+
+    case AVAudioSessionInterruptionTypeEnded:
+        NSLog(@"Audio Session Interruption case ended.");
+        [backgroundChannel invokeMethod:@"onPlay" arguments:nil];
+        // fork to handling method here...
+        // EG:[self handleInterruptionEnded];
+        break;
+
+    default:
+        NSLog(@"Audio Session Interruption Notification case default.");
+        break;
+} }
+
+- (void)routeChange:(NSNotification*)notification {
+
+NSDictionary *interuptionDict = notification.userInfo;
+
+NSInteger routeChangeReason = [[interuptionDict valueForKey:AVAudioSessionRouteChangeReasonKey] integerValue];
+
+switch (routeChangeReason) {
+    case AVAudioSessionRouteChangeReasonUnknown:
+        NSLog(@"routeChangeReason : AVAudioSessionRouteChangeReasonUnknown");
+        break;
+
+    case AVAudioSessionRouteChangeReasonNewDeviceAvailable:
+        // a headset was added or removed
+        NSLog(@"routeChangeReason : AVAudioSessionRouteChangeReasonNewDeviceAvailable");
+        break;
+
+    case AVAudioSessionRouteChangeReasonOldDeviceUnavailable:
+        // a headset was added or removed
+        NSLog(@"routeChangeReason : AVAudioSessionRouteChangeReasonOldDeviceUnavailable");
+        break;
+
+    case AVAudioSessionRouteChangeReasonCategoryChange:
+        // called at start - also when other audio wants to play
+        NSLog(@"routeChangeReason : AVAudioSessionRouteChangeReasonCategoryChange");//AVAudioSessionRouteChangeReasonCategoryChange
+        break;
+
+    case AVAudioSessionRouteChangeReasonOverride:
+        NSLog(@"routeChangeReason : AVAudioSessionRouteChangeReasonOverride");
+        break;
+
+    case AVAudioSessionRouteChangeReasonWakeFromSleep:
+        NSLog(@"routeChangeReason : AVAudioSessionRouteChangeReasonWakeFromSleep");
+        break;
+
+    case AVAudioSessionRouteChangeReasonNoSuitableRouteForCategory:
+        NSLog(@"routeChangeReason : AVAudioSessionRouteChangeReasonNoSuitableRouteForCategory");
+        break;
+
+    default:
+        break;
+} }
 
 - (MPRemoteCommandHandlerStatus) play: (MPRemoteCommandEvent *) event {
   NSLog(@"play");
