@@ -1608,7 +1608,8 @@ abstract class BackgroundAudioTask {
   ///
   /// By default, calls [onSkipToQueueItem] with the queue item after
   /// [AudioServiceBackground.mediaItem] if it exists.
-  Future<void> onSkipToNext() => _skip(1);
+  Future<void> onSkipToNext() => _
+    1);
 
   /// Called when a client has requested to skip to the previous item in the
   /// queue, such as via a request to [AudioService.skipToPrevious].
@@ -1701,7 +1702,7 @@ abstract class BackgroundAudioTask {
     if (mediaItem == null) return;
     final queue = AudioServiceBackground.queue ?? [];
     int i = queue.indexOf(mediaItem);
-    if (i == -1) return;
+    if (i == -1 || (i == 0 && offset < 0)) return;
     int newIndex = i + offset;
     if (newIndex < queue.length) await onSkipToQueueItem(queue[newIndex]?.id);
   }
