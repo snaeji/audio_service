@@ -1,11 +1,29 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Follow the instructions carefully on the next page.
 title: ''
-labels: ''
-assignees: ''
+labels: 1 backlog, enhancement
+assignees: ryanheise
 
 ---
+
+<!--
+
+        PLEASE READ CAREFULLY!
+
+
+
+
+
+        FOR YOUR FEATURE REQUEST TO BE PROCESSED, YOU WILL NEED
+        TO FILL IN ALL SECTIONS BELOW. DON'T DELETE THE HEADINGS.
+
+
+        THANK YOU :-D
+
+
+-->
+
 
 **Is your feature request related to a problem? Please describe.**
 A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]

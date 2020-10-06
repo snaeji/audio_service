@@ -1,3 +1,106 @@
+## 0.15.1
+
+* Fix loading of file:// artUri values.
+* Allow booleans/doubles in MediaItems.
+* Silently ignore duplicate onStop requests.
+
+## 0.15.0
+
+* Web support (@keaganhilliard)
+* macOS support (@hacker1024)
+* Route next/previous buttons to onClick on Android (@stonega)
+* Correctly scale skip intervals for control center (@subhash279)
+* Handle repeated stop/start calls more robustly.
+* Fix Android 11 bugs.
+
+## 0.14.1
+
+* audio_session dependency now supports minSdkVersion 16 on Android.
+
+## 0.14.0
+
+* audio session management now handled by audio_session (see [Migration Guide](https://github.com/ryanheise/audio_service/wiki/Migration-Guide#0140)).
+* Exceptions in background audio task are logged and forwarded to client.
+
+## 0.13.0
+
+* All BackgroundAudioTask callbacks are now async.
+* Add default implementation of onSkipToNext/onSkipToPrevious.
+* Bug fixes.
+
+## 0.12.0
+
+* Add setRepeatMode/setShuffleMode.
+* Enable iOS Control Center buttons based on setState.
+* Support seek forward/backward in iOS Control Center.
+* Add default behaviour to BackgroundAudioTask.
+* Bug fixes.
+* Simplify example.
+
+## 0.11.2
+
+* Fix bug with album metadata on Android.
+
+## 0.11.1
+
+* Allow setting the iOS audio session category and options.
+* Allow AudioServiceWidget to recognise swipe gesture on iOS.
+* Check for null title and album on Android.
+
+## 0.11.0
+
+* Breaking change: onStop must await super.onStop to shutdown task.
+* Fix Android memory leak.
+
+## 0.10.0
+
+* Replace androidStopOnRemoveTask with onTaskRemoved callback.
+* Add onClose callback.
+* Breaking change: new MediaButtonReceiver in AndroidManifest.xml.
+
+## 0.9.0
+
+* New state model: split into playing + processingState.
+* androidStopForegroundOnPause ties foreground state to playing state.
+* Add MediaItem.toJson/fromJson.
+* Add AudioService.notificationClickEventStream (Android).
+* Add AudioService.updateMediaItem.
+* Add AudioService.setSpeed.
+* Add PlaybackState.bufferedPosition.
+* Add custom AudioService.start parameters.
+* Rename replaceQueue -> updateQueue.
+* Rename Android-specific start parameters with android- prefix.
+* Use Duration type for all time values.
+* Pass fastForward/rewind intervals through to background task.
+* Allow connections from background contexts (e.g. android_alarm_manager).
+* Unify iOS/Android focus APIs.
+* Bug fixes and dependency updates.
+
+## 0.8.0
+
+* Allow UI to await the result of custom actions.
+* Allow background to broadcast custom events to UI.
+* Improve memory management for art bitmaps on Android.
+* Convenience methods: replaceQueue, playMediaItem, addQueueItems.
+* Bug fixes and dependency updates.
+
+## 0.7.2
+
+* Shutdown background task if task killed by IO (Android).
+* Bug fixes and dependency updates.
+
+## 0.7.1
+
+* Add AudioServiceWidget to auto-manage connections.
+* Allow file URIs for artUri.
+
+## 0.7.0
+
+* Support skip forward/backward in command center (iOS).
+* Add 'extras' field to MediaItem.
+* Artwork caching and preloading supported on Android+iOS.
+* Bug fixes.
+
 ## 0.6.2
 
 * Bug fixes.

@@ -1,11 +1,28 @@
 ---
 name: Documentation request
-about: Suggest an improvement to the documentation
+about: Follow the instructions carefully on the next page.
 title: ''
-labels: ''
-assignees: ''
+labels: 1 backlog, documentation
+assignees: ryanheise
 
 ---
+
+<!--
+
+        PLEASE READ CAREFULLY!
+
+
+
+
+
+        FOR YOUR DOCUMENTATION REQUEST TO BE PROCESSED, YOU WILL NEED
+        TO FILL IN ALL SECTIONS BELOW. DON'T DELETE THE HEADINGS.
+
+
+        THANK YOU :-D
+
+
+-->
 
 **To which pages does your suggestion apply?**
 

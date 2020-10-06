@@ -15,37 +15,34 @@ import android.graphics.BitmapFactory;
 import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
-import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
-import androidx.annotation.RequiresApi;
-import androidx.core.app.NotificationCompat;
 import android.support.v4.media.MediaBrowserCompat;
-import androidx.media.MediaBrowserServiceCompat;
 import android.support.v4.media.MediaDescriptionCompat;
 import android.support.v4.media.MediaMetadataCompat;
 import android.support.v4.media.RatingCompat;
-import androidx.media.app.NotificationCompat.MediaStyle;
-import androidx.media.session.MediaButtonReceiver;
 import android.support.v4.media.session.MediaControllerCompat;
 import android.support.v4.media.session.MediaSessionCompat;
 import android.support.v4.media.session.PlaybackStateCompat;
+import android.util.LruCache;
 import android.view.KeyEvent;
 
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.URL;
+import androidx.annotation.RequiresApi;
+import androidx.core.app.NotificationCompat;
+import androidx.media.MediaBrowserServiceCompat;
+import androidx.media.app.NotificationCompat.MediaStyle;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import android.os.Handler;
-import android.os.Looper;
 import java.util.Set;
 
-public class AudioService extends MediaBrowserServiceCompat implements AudioManager.OnAudioFocusChangeListener {
+public class AudioService extends MediaBrowserServiceCompat {
 	private static final int NOTIFICATION_ID = 1124;
 	private static final int REQUEST_CONTENT_INTENT = 1000;
 	private static final String MEDIA_ROOT_ID = "root";
@@ -67,22 +64,27 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 	static String androidNotificationIcon;
 	static boolean androidNotificationClickStartsActivity;
 	static boolean androidNotificationOngoing;
-	static boolean shouldPreloadArtwork;
 	static boolean androidStopForegroundOnPause;
-	static boolean androidStopOnRemoveTask;
 	private static List<MediaSessionCompat.QueueItem> queue = new ArrayList<MediaSessionCompat.QueueItem>();
 	private static int queueIndex = -1;
-	private static Map<String,MediaMetadataCompat> mediaMetadataCache = new HashMap<>();
+	private static Map<String, MediaMetadataCompat> mediaMetadataCache = new HashMap<>();
 	private static Set<String> artUriBlacklist = new HashSet<>();
-	private static Map<String,Bitmap> artBitmapCache = new HashMap<>(); // TODO: old bitmaps should expire FIFO
+	private static LruCache<String, Bitmap> artBitmapCache;
+	private static Size artDownscaleSize;
+	private static boolean playing = false;
+	private static AudioProcessingState processingState = AudioProcessingState.none;
+	private static int repeatMode;
+	private static int shuffleMode;
+	private static boolean notificationCreated;
 
-	public static void init(Activity activity, boolean resumeOnClick, String androidNotificationChannelName, String androidNotificationChannelDescription, Integer notificationColor, String androidNotificationIcon, boolean androidNotificationClickStartsActivity, boolean androidNotificationOngoing, boolean shouldPreloadArtwork, boolean androidStopForegroundOnPause, boolean androidStopOnRemoveTask, ServiceListener listener) {
+	public static void init(Activity activity, boolean resumeOnClick, String androidNotificationChannelName, String androidNotificationChannelDescription, String action, Integer notificationColor, String androidNotificationIcon, boolean androidNotificationClickStartsActivity, boolean androidNotificationOngoing, boolean androidStopForegroundOnPause, Size artDownscaleSize, ServiceListener listener) {
 		if (running)
 			throw new IllegalStateException("AudioService already running");
 		running = true;
 
 		Context context = activity.getApplicationContext();
 		Intent intent = new Intent(context, activity.getClass());
+		intent.setAction(action);
 		contentIntent = PendingIntent.getActivity(context, REQUEST_CONTENT_INTENT, intent, PendingIntent.FLAG_UPDATE_CURRENT);
 		AudioService.listener = listener;
 		AudioService.resumeOnClick = resumeOnClick;
@@ -92,9 +94,47 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		AudioService.androidNotificationIcon = androidNotificationIcon;
 		AudioService.androidNotificationClickStartsActivity = androidNotificationClickStartsActivity;
 		AudioService.androidNotificationOngoing = androidNotificationOngoing;
-		AudioService.shouldPreloadArtwork = shouldPreloadArtwork;
 		AudioService.androidStopForegroundOnPause = androidStopForegroundOnPause;
-		AudioService.androidStopOnRemoveTask = androidStopOnRemoveTask;
+		AudioService.artDownscaleSize = artDownscaleSize;
+
+		notificationCreated = false;
+		playing = false;
+		processingState = AudioProcessingState.none;
+		repeatMode = 0;
+		shuffleMode = 0;
+
+		// Get max available VM memory, exceeding this amount will throw an
+		// OutOfMemory exception. Stored in kilobytes as LruCache takes an
+		// int in its constructor.
+		final int maxMemory = (int)(Runtime.getRuntime().maxMemory() / 1024);
+
+		// Use 1/8th of the available memory for this memory cache.
+		final int cacheSize = maxMemory / 8;
+
+		artBitmapCache = new LruCache<String, Bitmap>(cacheSize) {
+			@Override
+			protected int sizeOf(String key, Bitmap bitmap) {
+				// The cache size will be measured in kilobytes rather than
+				// number of items.
+				return bitmap.getByteCount() / 1024;
+			}
+		};
+	}
+
+	public static AudioProcessingState getProcessingState() {
+		return processingState;
+	}
+
+	public static boolean isPlaying() {
+		return playing;
+	}
+
+	public static int getRepeatMode() {
+		return repeatMode;
+	}
+
+	public static int getShuffleMode() {
+		return shuffleMode;
 	}
 
 	public void stop() {
@@ -106,20 +146,25 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		androidNotificationChannelDescription = null;
 		notificationColor = null;
 		androidNotificationIcon = null;
+		artDownscaleSize = null;
 		queue.clear();
 		queueIndex = -1;
 		mediaMetadataCache.clear();
 		actions.clear();
-		artBitmapCache.clear();
+		artBitmapCache.evictAll();
 		compactActionIndices = null;
 
 		mediaSession.setQueue(queue);
-		instance.abandonAudioFocus();
-		unregisterNoisyReceiver();
 		mediaSession.setActive(false);
-		if (wakeLock.isHeld()) wakeLock.release();
+		releaseWakeLock();
 		stopForeground(true);
 		stopSelf();
+		// This still does not solve the Android 11 problem.
+		// if (notificationCreated) {
+		// 	NotificationManager notificationManager = (NotificationManager)getSystemService(Context.NOTIFICATION_SERVICE);
+		// 	notificationManager.cancel(NOTIFICATION_ID);
+		// }
+		notificationCreated = false;
 	}
 
 	public static boolean isRunning() {
@@ -127,10 +172,8 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 	}
 
 	private PowerManager.WakeLock wakeLock;
-	private BroadcastReceiver noisyReceiver;
 	private MediaSessionCompat mediaSession;
 	private MediaSessionCallback mediaSessionCallback;
-	private AudioManager audioManager;
 	private MediaMetadataCompat preparedMedia;
 	private List<NotificationCompat.Action> actions = new ArrayList<NotificationCompat.Action>();
 	private int[] compactActionIndices;
@@ -153,18 +196,19 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 	}
 
 	PendingIntent buildMediaButtonPendingIntent(long action) {
-		ComponentName component = new ComponentName(getPackageName(), "androidx.media.session.MediaButtonReceiver");
-		return buildMediaButtonPendingIntent(component, action);
-	}
-
-	PendingIntent buildMediaButtonPendingIntent(ComponentName component, long action) {
 		int keyCode = toKeyCode(action);
 		if (keyCode == KeyEvent.KEYCODE_UNKNOWN)
 			return null;
-		Intent intent = new Intent(Intent.ACTION_MEDIA_BUTTON);
-		intent.setComponent(component);
+		Intent intent = new Intent(this, MediaButtonReceiver.class);
+		intent.setAction(Intent.ACTION_MEDIA_BUTTON);
 		intent.putExtra(Intent.EXTRA_KEY_EVENT, new KeyEvent(KeyEvent.ACTION_DOWN, keyCode));
 		return PendingIntent.getBroadcast(this, keyCode, intent, 0);
+	}
+
+	PendingIntent buildDeletePendingIntent() {
+		Intent intent = new Intent(this, MediaButtonReceiver.class);
+		intent.setAction(MediaButtonReceiver.ACTION_NOTIFICATION_DELETE);
+		return PendingIntent.getBroadcast(this, 0, intent, 0);
 	}
 
 	public static int toKeyCode(long action) {
@@ -177,103 +221,108 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		}
 	}
 
-	void setState(List<NotificationCompat.Action> actions, int actionBits, int[] compactActionIndices, int playbackState, long position, float speed, long updateTime) {
+	void setState(List<NotificationCompat.Action> actions, int actionBits, int[] compactActionIndices, AudioProcessingState processingState, boolean playing, long position, long bufferedPosition, float speed, long updateTime, int repeatMode, int shuffleMode) {
 		this.actions = actions;
 		this.compactActionIndices = compactActionIndices;
+		boolean wasPlaying = AudioService.playing;
+		AudioService.processingState = processingState;
+		AudioService.playing = playing;
+		AudioService.repeatMode = repeatMode;
+		AudioService.shuffleMode = shuffleMode;
 
 		PlaybackStateCompat.Builder stateBuilder = new PlaybackStateCompat.Builder()
-			.setActions(PlaybackStateCompat.ACTION_PLAY_PAUSE|actionBits)
-			.setState(playbackState, position, speed, updateTime);
+				.setActions(PlaybackStateCompat.ACTION_PLAY_PAUSE | actionBits)
+				.setState(getPlaybackState(), position, speed, updateTime)
+				.setBufferedPosition(bufferedPosition);
 		mediaSession.setPlaybackState(stateBuilder.build());
+
+		if (!running) return;
+
+		if (!wasPlaying && playing) {
+			enterPlayingState();
+		} else if (wasPlaying && !playing) {
+			exitPlayingState();
+		}
 
 		updateNotification();
 	}
 
+	public int getPlaybackState() {
+		switch (processingState) {
+		case none: return PlaybackStateCompat.STATE_NONE;
+		case connecting: return PlaybackStateCompat.STATE_CONNECTING;
+		case ready: return playing ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
+		case buffering: return PlaybackStateCompat.STATE_BUFFERING;
+		case fastForwarding: return PlaybackStateCompat.STATE_FAST_FORWARDING;
+		case rewinding: return PlaybackStateCompat.STATE_REWINDING;
+		case skippingToPrevious: return PlaybackStateCompat.STATE_SKIPPING_TO_PREVIOUS;
+		case skippingToNext: return PlaybackStateCompat.STATE_SKIPPING_TO_NEXT;
+		case skippingToQueueItem: return PlaybackStateCompat.STATE_SKIPPING_TO_QUEUE_ITEM;
+		case completed: return playing ? PlaybackStateCompat.STATE_PLAYING : PlaybackStateCompat.STATE_PAUSED;
+		case stopped: return PlaybackStateCompat.STATE_STOPPED;
+		case error: return PlaybackStateCompat.STATE_ERROR;
+		default: return PlaybackStateCompat.STATE_NONE;
+		}
+	}
+
 	private Notification buildNotification() {
-		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-			createChannel();
-		int iconId = getResourceId(androidNotificationIcon);
 		int[] compactActionIndices = this.compactActionIndices;
 		if (compactActionIndices == null) {
 			compactActionIndices = new int[Math.min(MAX_COMPACT_ACTIONS, actions.size())];
 			for (int i = 0; i < compactActionIndices.length; i++) compactActionIndices[i] = i;
 		}
-		MediaControllerCompat controller = mediaSession.getController();
-		String contentTitle = "";
-		String contentText = "";
-		CharSequence subText = null;
-		Bitmap artBitmap = null;
+		NotificationCompat.Builder builder = getNotificationBuilder();
 		if (mediaMetadata != null) {
 			MediaDescriptionCompat description = mediaMetadata.getDescription();
-			contentTitle = description.getTitle().toString();
-			contentText = description.getSubtitle().toString();
-			artBitmap = description.getIconBitmap();
-			subText = description.getDescription();
+			if (description.getTitle() != null)
+				builder.setContentTitle(description.getTitle());
+			if (description.getSubtitle() != null)
+				builder.setContentText(description.getSubtitle());
+			if (description.getDescription() != null)
+				builder.setSubText(description.getDescription());
+			if (description.getIconBitmap() != null)
+				builder.setLargeIcon(description.getIconBitmap());
 		}
-		NotificationCompat.Builder builder = new NotificationCompat.Builder(AudioService.this, notificationChannelId)
-				.setSmallIcon(iconId)
-				.setContentTitle(contentTitle)
-				.setContentText(contentText)
-				.setSubText(subText)
-				.setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-				.setShowWhen(false)
-				.setDeleteIntent(buildMediaButtonPendingIntent(PlaybackStateCompat.ACTION_STOP))
-				;
 		if (androidNotificationClickStartsActivity)
-			builder.setContentIntent(controller.getSessionActivity());
+			builder.setContentIntent(mediaSession.getController().getSessionActivity());
 		if (notificationColor != null)
 			builder.setColor(notificationColor);
 		for (NotificationCompat.Action action : actions) {
 			builder.addAction(action);
 		}
-		if (artBitmap != null)
-			builder.setLargeIcon(artBitmap);
 		builder.setStyle(new MediaStyle()
 				.setMediaSession(mediaSession.getSessionToken())
 				.setShowActionsInCompactView(compactActionIndices)
 				.setShowCancelButton(true)
 				.setCancelButtonIntent(buildMediaButtonPendingIntent(PlaybackStateCompat.ACTION_STOP))
-				);
+		);
 		if (androidNotificationOngoing)
 			builder.setOngoing(true);
 		Notification notification = builder.build();
 		return notification;
 	}
 
-	private int requestAudioFocus() {
-		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-			return requestAudioFocusO();
-		else
-			return audioManager.requestAudioFocus(this,
-					AudioManager.STREAM_MUSIC,
-					AudioManager.AUDIOFOCUS_GAIN);
+	private NotificationCompat.Builder getNotificationBuilder() {
+		NotificationCompat.Builder notificationBuilder = null;
+		if (notificationBuilder == null) {
+			if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+				createChannel();
+			int iconId = getResourceId(androidNotificationIcon);
+			notificationBuilder = new NotificationCompat.Builder(this, notificationChannelId)
+					.setSmallIcon(iconId)
+					.setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+					.setShowWhen(false)
+					.setDeleteIntent(buildDeletePendingIntent())
+			;
+		}
+		return notificationBuilder;
 	}
 
-	@RequiresApi(Build.VERSION_CODES.O)
-	private int requestAudioFocusO() {
-		AudioAttributes audioAttributes = new AudioAttributes.Builder()
-				.setUsage(AudioAttributes.USAGE_MEDIA)
-				.setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-				.build();
-		audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-				.setAudioAttributes(audioAttributes)
-				.setWillPauseWhenDucked(true)
-				.setOnAudioFocusChangeListener(this)
-				.build();
-		return audioManager.requestAudioFocus((AudioFocusRequest)audioFocusRequest);
+	public void handleDeleteNotification() {
+		if (listener == null) return;
+		listener.onClose();
 	}
 
-	private void abandonAudioFocus() {
-		if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-			abandonAudioFocusO();
-		else
-			audioManager.abandonAudioFocus(this);
-	}
-
-	@RequiresApi(Build.VERSION_CODES.O)
-	private void abandonAudioFocusO() {
-		audioManager.abandonAudioFocusRequest((AudioFocusRequest)audioFocusRequest);
-	}
 
 	@RequiresApi(Build.VERSION_CODES.O)
 	private void createChannel() {
@@ -288,34 +337,53 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 	}
 
 	private void updateNotification() {
+		if (!notificationCreated) return;
 		NotificationManager notificationManager = (NotificationManager)getSystemService(Context.NOTIFICATION_SERVICE);
 		notificationManager.notify(NOTIFICATION_ID, buildNotification());
 	}
 
-	private void registerNoisyReceiver() {
-		if (noisyReceiver != null) return;
-		noisyReceiver = new BroadcastReceiver() {
-			@Override
-			public void onReceive(Context context, Intent intent) {
-				if (AudioManager.ACTION_AUDIO_BECOMING_NOISY.equals(intent.getAction())) {
-					listener.onAudioBecomingNoisy();
-				}
-			}
-		};
-		registerReceiver(noisyReceiver, new IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY));
+	private boolean enterPlayingState() {
+		startService(new Intent(AudioService.this, AudioService.class));
+		if (!mediaSession.isActive())
+			mediaSession.setActive(true);
+
+		acquireWakeLock();
+		mediaSession.setSessionActivity(contentIntent);
+		internalStartForeground();
+		return true;
 	}
 
-	private void unregisterNoisyReceiver() {
-		if (noisyReceiver == null) return;
-		unregisterReceiver(noisyReceiver);
-		noisyReceiver = null;
+	private void exitPlayingState() {
+		if (androidStopForegroundOnPause) {
+			exitForegroundState();
+		}
 	}
 
-	static MediaMetadataCompat createMediaMetadata(String mediaId, String album, String title, String artist, String genre, Long duration, String artUri, String displayTitle, String displaySubtitle, String displayDescription, RatingCompat rating) {
+	private void exitForegroundState() {
+		stopForeground(false);
+		releaseWakeLock();
+	}
+
+	private void internalStartForeground() {
+		startForeground(NOTIFICATION_ID, buildNotification());
+		notificationCreated = true;
+	}
+
+	private void acquireWakeLock() {
+		if (!wakeLock.isHeld())
+			wakeLock.acquire();
+	}
+
+	private void releaseWakeLock() {
+		if (wakeLock.isHeld())
+			wakeLock.release();
+	}
+
+	static MediaMetadataCompat createMediaMetadata(String mediaId, String album, String title, String artist, String genre, Long duration, String artUri, Boolean playable, String displayTitle, String displaySubtitle, String displayDescription, RatingCompat rating, Map<?, ?> extras) {
 		MediaMetadataCompat.Builder builder = new MediaMetadataCompat.Builder()
-			.putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, mediaId)
-			.putString(MediaMetadataCompat.METADATA_KEY_ALBUM, album)
-			.putString(MediaMetadataCompat.METADATA_KEY_TITLE, title);
+				.putString(MediaMetadataCompat.METADATA_KEY_MEDIA_ID, mediaId)
+				.putString(MediaMetadataCompat.METADATA_KEY_ALBUM, album)
+				.putString(MediaMetadataCompat.METADATA_KEY_TITLE, title);
 		if (artist != null)
 			builder.putString(MediaMetadataCompat.METADATA_KEY_ARTIST, artist);
 		if (genre != null)
@@ -324,12 +392,20 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 			builder.putLong(MediaMetadataCompat.METADATA_KEY_DURATION, duration);
 		if (artUri != null) {
 			builder.putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON_URI, artUri);
-			Bitmap bitmap = artBitmapCache.get(artUri);
-			if (bitmap != null) {
-				builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, bitmap);
-				builder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, bitmap);
+			String artCacheFilePath = null;
+			if (extras != null) {
+				artCacheFilePath = (String)extras.get("artCacheFile");
+			}
+			if (artCacheFilePath != null) {
+				Bitmap bitmap = loadArtBitmapFromFile(artCacheFilePath);
+				if (bitmap != null) {
+					builder.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, bitmap);
+					builder.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, bitmap);
+				}
 			}
 		}
+		if (playable != null)
+			builder.putLong("playable_long", playable ? 1 : 0);
 		if (displayTitle != null)
 			builder.putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_TITLE, displayTitle);
 		if (displaySubtitle != null)
@@ -338,6 +414,23 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 			builder.putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_DESCRIPTION, displayDescription);
 		if (rating != null) {
 			builder.putRating(MediaMetadataCompat.METADATA_KEY_RATING, rating);
+		}
+		if (extras != null) {
+			for (Object o : extras.keySet()) {
+				String key = (String)o;
+				Object value = extras.get(key);
+				if (value instanceof Long) {
+					builder.putLong("extra_long_" + key, (Long)value);
+				} else if (value instanceof Integer) {
+					builder.putLong("extra_long_" + key, (Integer)value);
+				} else if (value instanceof String) {
+					builder.putString("extra_string_" + key, (String)value);
+				} else if (value instanceof Boolean) {
+					builder.putLong("extra_boolean_" + key, (Boolean)value ? 1 : 0);
+				} else if (value instanceof Double) {
+					builder.putString("extra_double_" + key, value.toString());
+				}
+			}
 		}
 		MediaMetadataCompat mediaMetadata = builder.build();
 		mediaMetadataCache.put(mediaId, mediaMetadata);
@@ -353,7 +446,6 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		super.onCreate();
 		instance = this;
 		notificationChannelId = getApplication().getPackageName() + ".channel";
-		audioManager = (AudioManager)getSystemService(Context.AUDIO_SERVICE);
 
 		mediaSession = new MediaSessionCompat(this, "media-session");
 		mediaSession.setMediaButtonReceiver(null); // TODO: Make this configurable
@@ -365,7 +457,7 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		setSessionToken(mediaSession.getSessionToken());
 		mediaSession.setQueue(queue);
 
-		PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+		PowerManager pm = (PowerManager)getSystemService(Context.POWER_SERVICE);
 		wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, AudioService.class.getName());
 	}
 
@@ -376,92 +468,58 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 	void setQueue(List<MediaSessionCompat.QueueItem> queue) {
 		this.queue = queue;
 		mediaSession.setQueue(queue);
-		if (shouldPreloadArtwork)
-			preloadArtwork(queue);
 	}
 
-	void preloadArtwork(final List<MediaSessionCompat.QueueItem> queue) {
-		new Thread() {
-			@Override
-			public void run() {
-				for (MediaSessionCompat.QueueItem queueItem : queue) {
-					final MediaDescriptionCompat description = queueItem.getDescription();
-					synchronized (AudioService.this) {
-						final MediaMetadataCompat mediaMetadata = getMediaMetadata(description.getMediaId());
-						if (needToLoadArt(mediaMetadata))
-							loadArtBitmap(mediaMetadata);
-					}
-				}
-			}
-		}.start();
+	void playMediaItem(MediaDescriptionCompat description) {
+		mediaSessionCallback.onPlayMediaItem(description);
 	}
 
-	// Call only on main thread
 	void setMetadata(final MediaMetadataCompat mediaMetadata) {
 		this.mediaMetadata = mediaMetadata;
 		mediaSession.setMetadata(mediaMetadata);
 		updateNotification();
+	}
 
-		if (needToLoadArt(mediaMetadata)) {
-			new Thread() {
-				@Override
-				public void run() {
-					loadArtBitmap(mediaMetadata);
-				}
-			}.start();
+	static Bitmap loadArtBitmapFromFile(String path) {
+		Bitmap bitmap = artBitmapCache.get(path);
+		if (bitmap != null) return bitmap;
+		try {
+			if (artDownscaleSize != null) {
+				BitmapFactory.Options options = new BitmapFactory.Options();
+				options.inJustDecodeBounds = true;
+				BitmapFactory.decodeFile(path, options);
+				int imageHeight = options.outHeight;
+				int imageWidth = options.outWidth;
+				options.inSampleSize = calculateInSampleSize(options, artDownscaleSize.width, artDownscaleSize.height);
+				options.inJustDecodeBounds = false;
+
+				bitmap = BitmapFactory.decodeFile(path, options);
+			} else {
+				bitmap = BitmapFactory.decodeFile(path);
+			}
+			artBitmapCache.put(path, bitmap);
+			return bitmap;
+		} catch (Exception e) {
+			e.printStackTrace();
+			return null;
 		}
 	}
 
-	// Must not be called on the main thread
-	synchronized void loadArtBitmap(MediaMetadataCompat mediaMetadata) {
-		if (needToLoadArt(mediaMetadata)) {
-			Uri artUri = mediaMetadata.getDescription().getIconUri();
-			Bitmap bitmap = artBitmapCache.get(artUri.toString());
-			if (bitmap == null) {
-				InputStream in = null;
-				try {
-					in = new URL(artUri.toString()).openConnection().getInputStream();
-					bitmap = BitmapFactory.decodeStream(in);
-					if (!running)
-						return;
-					artBitmapCache.put(artUri.toString(), bitmap);
-				} catch (IOException e) {
-					artUriBlacklist.add(artUri.toString());
-					e.printStackTrace();
-					return;
-				} finally {
-					if (in != null) {
-						try {
-							in.close();
-						} catch (Exception e) {
-							e.printStackTrace();
-						}
-					}
-				}
-			}
-			String mediaId = mediaMetadata.getDescription().getMediaId();
-			final MediaMetadataCompat updatedMediaMetadata = new MediaMetadataCompat.Builder(mediaMetadata)
-				.putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, bitmap)
-				.putBitmap(MediaMetadataCompat.METADATA_KEY_DISPLAY_ICON, bitmap)
-				.build();
-			mediaMetadataCache.put(mediaId, updatedMediaMetadata);
-			// If this the current media item, update the notification
-			if (this.mediaMetadata != null && mediaId.equals(this.mediaMetadata.getDescription().getMediaId())) {
-				handler.post(new Runnable() {
-					@Override
-					public void run() {
-						setMetadata(updatedMediaMetadata);
-					}
-				});
+	private static int calculateInSampleSize(BitmapFactory.Options options, int reqWidth, int reqHeight) {
+		final int height = options.outHeight;
+		final int width = options.outWidth;
+		int inSampleSize = 1;
+
+		if (height > reqHeight || width > reqWidth) {
+			final int halfHeight = height / 2;
+			final int halfWidth = width / 2;
+			while ((halfHeight / inSampleSize) >= reqHeight
+					&& (halfWidth / inSampleSize) >= reqWidth) {
+				inSampleSize *= 2;
 			}
 		}
-	}
 
-	boolean needToLoadArt(MediaMetadataCompat mediaMetadata) {
-		final MediaDescriptionCompat description = mediaMetadata.getDescription();
-		Bitmap bitmap = description.getIconBitmap();
-		Uri artUri = description.getIconUri();
-		return bitmap == null && artUri != null && !artUriBlacklist.contains(artUri.toString());
+		return inSampleSize;
 	}
 
 	@Override
@@ -486,37 +544,20 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 
 	@Override
 	public void onDestroy() {
-		instance = null;
 		super.onDestroy();
+		if (listener != null) {
+			listener.onDestroy();
+		}
+		mediaSession.release();
+		instance = null;
 	}
 
 	@Override
 	public void onTaskRemoved(Intent rootIntent) {
-		MediaControllerCompat controller = mediaSession.getController();
-		if (androidStopOnRemoveTask || (androidStopForegroundOnPause && controller.getPlaybackState().getState() == PlaybackStateCompat.STATE_PAUSED)) {
-			listener.onStop();
+		if (listener != null) {
+			listener.onTaskRemoved();
 		}
 		super.onTaskRemoved(rootIntent);
-	}
-
-	@Override
-	public void onAudioFocusChange(int focusChange) {
-		switch (focusChange) {
-			case AudioManager.AUDIOFOCUS_GAIN:
-				listener.onAudioFocusGained();
-				break;
-			case AudioManager.AUDIOFOCUS_LOSS:
-				listener.onAudioFocusLost();
-				break;
-			case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
-				listener.onAudioFocusLostTransient();
-				break;
-			case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
-				listener.onAudioFocusLostTransientCanDuck();
-				break;
-			default:
-				break;
-		}
 	}
 
 	public class MediaSessionCallback extends MediaSessionCompat.Callback {
@@ -549,30 +590,7 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		@Override
 		public void onPlay() {
 			if (listener == null) return;
-			play(new Runnable() {
-				public void run() {
-					listener.onPlay();
-				}
-			});
-		}
-
-		private void play(Runnable runner) {
-			int result = requestAudioFocus();
-			if (result != AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
-				// Don't play audio
-				return;
-			}
-
-			startService(new Intent(AudioService.this, AudioService.class));
-			if (!mediaSession.isActive())
-				mediaSession.setActive(true);
-
-			runner.run();
-
-			acquireWakeLock();
-			registerNoisyReceiver();
-			mediaSession.setSessionActivity(contentIntent);
-			startForeground(NOTIFICATION_ID, buildNotification());
+			listener.onPlay();
 		}
 
 		@Override
@@ -586,16 +604,7 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		@Override
 		public void onPlayFromMediaId(final String mediaId, final Bundle extras) {
 			if (listener == null) return;
-			play(new Runnable() {
-				public void run() {
-					listener.onPlayFromMediaId(mediaId);
-				}
-			});
-		}
-
-		private void acquireWakeLock() {
-			if (!wakeLock.isHeld())
-				wakeLock.acquire();
+			listener.onPlayFromMediaId(mediaId);
 		}
 
 		@Override
@@ -609,12 +618,6 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 					break;
 				case KEYCODE_BYPASS_PAUSE:
 					onPause();
-					break;
-				case KeyEvent.KEYCODE_MEDIA_NEXT:
-					onSkipToNext();
-					break;
-				case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
-					onSkipToPrevious();
 					break;
 				case KeyEvent.KEYCODE_MEDIA_STOP:
 					onStop();
@@ -633,22 +636,15 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 				// around this, we make PLAY and PAUSE actions use different keycodes:
 				// KEYCODE_BYPASS_PLAY/PAUSE. Now if we get KEYCODE_MEDIA_PLAY/PUASE
 				// we know it is actually a media button press.
+				case KeyEvent.KEYCODE_MEDIA_NEXT:
+				case KeyEvent.KEYCODE_MEDIA_PREVIOUS:
 				case KeyEvent.KEYCODE_MEDIA_PLAY:
 				case KeyEvent.KEYCODE_MEDIA_PAUSE:
-				// These are the "genuine" media button click events
+					// These are the "genuine" media button click events
 				case KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE:
 				case KeyEvent.KEYCODE_HEADSETHOOK:
 					MediaControllerCompat controller = mediaSession.getController();
-					// If you press the media button while in the pause state, we reactivate the media session.
-					if (resumeOnClick && controller.getPlaybackState().getState() == PlaybackStateCompat.STATE_PAUSED) {
-						play(new Runnable() {
-							public void run() {
-								listener.onClick(mediaControl(event));
-							}
-						});
-					} else {
-						listener.onClick(mediaControl(event));
-					}
+					listener.onClick(mediaControl(event));
 					break;
 				}
 			}
@@ -673,10 +669,6 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		public void onPause() {
 			if (listener == null) return;
 			listener.onPause();
-			unregisterNoisyReceiver();
-			if (androidStopForegroundOnPause) {
-				stopForeground(false);
-			}
 		}
 
 		@Override
@@ -728,46 +720,94 @@ public class AudioService extends MediaBrowserServiceCompat implements AudioMana
 		}
 
 		@Override
+		public void onSetRepeatMode(int repeatMode) {
+			if (listener == null) return;
+			listener.onSetRepeatMode(repeatMode);
+		}
+
+		@Override
+		public void onSetShuffleMode(int shuffleMode) {
+			if (listener == null) return;
+			listener.onSetShuffleMode(shuffleMode);
+		}
+
+		@Override
 		public void onSetRating(RatingCompat rating, Bundle extras) {
 			if (listener == null) return;
 			listener.onSetRating(rating, extras);
+		}
+
+		//
+		// NON-STANDARD METHODS
+		//
+
+		public void onPlayMediaItem(final MediaDescriptionCompat description) {
+			if (listener == null) return;
+			listener.onPlayMediaItem(getMediaMetadata(description.getMediaId()));
 		}
 	}
 
 	public static interface ServiceListener {
 		void onLoadChildren(String parentMediaId, Result<List<MediaBrowserCompat.MediaItem>> result);
 
-		void onAudioFocusGained();
-		void onAudioFocusLost();
-		void onAudioFocusLostTransient();
-		void onAudioFocusLostTransientCanDuck();
-		void onAudioBecomingNoisy();
-
 		void onClick(MediaControl mediaControl);
+
 		void onPrepare();
+
 		void onPrepareFromMediaId(String mediaId);
+
 		//void onPrepareFromSearch(String query);
 		//void onPrepareFromUri(String uri);
 		void onPlay();
+
 		void onPlayFromMediaId(String mediaId);
+
 		//void onPlayFromSearch(String query, Map<?,?> extras);
 		//void onPlayFromUri(String uri, Map<?,?> extras);
 		void onSkipToQueueItem(long id);
+
 		void onPause();
+
 		void onSkipToNext();
+
 		void onSkipToPrevious();
+
 		void onFastForward();
+
 		void onRewind();
+
 		void onStop();
+
+		void onDestroy();
+
 		void onSeekTo(long pos);
+
 		void onSetRating(RatingCompat rating);
+
 		void onSetRating(RatingCompat rating, Bundle extras);
-		//void onSetRepeatMode(@PlaybackStateCompat.RepeatMode int repeatMode)
+
+		void onSetRepeatMode(int repeatMode);
+
 		//void onSetShuffleModeEnabled(boolean enabled);
-		//void onSetShuffleMode(@PlaybackStateCompat.ShuffleMode int shuffleMode);
+
+		void onSetShuffleMode(int shuffleMode);
+
 		//void onCustomAction(String action, Bundle extras);
+
 		void onAddQueueItem(MediaMetadataCompat metadata);
+
 		void onAddQueueItemAt(MediaMetadataCompat metadata, int index);
+
 		void onRemoveQueueItem(MediaMetadataCompat metadata);
+
+		//
+		// NON-STANDARD METHODS
+		//
+
+		void onPlayMediaItem(MediaMetadataCompat metadata);
+
+		void onTaskRemoved();
+
+		void onClose();
 	}
 }

@@ -3,16 +3,17 @@ description: Demonstrates how to use the audio_service plugin.
 publish_to: 'none'
 
 environment:
-  sdk: '>=2.6.0 <3.0.0'
+  sdk: ">=2.7.0 <3.0.0"
 
 dependencies:
   flutter:
     sdk: flutter
 
-  path_provider: ^1.5.1
-  just_audio: ^0.0.6
+  path_provider: ^1.6.10
+  audio_session: ^0.0.5
+  just_audio: ^0.4.0
   flutter_tts: ^0.8.5
-  rxdart: ^0.23.1
+  rxdart: ^0.24.1
   audio_service:
     path: ../
 
